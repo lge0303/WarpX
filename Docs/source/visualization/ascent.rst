@@ -176,3 +176,26 @@ When the trigger condition is meet, ``cycle() == 300``, the actions in :code:`tr
               db_name: "cinema_out"
 
 You can view the Cinema Database result by opening :code:`cinema_databases/cinema_out/index.html`.
+
+Replay
+-------------------------
+
+`Replay <https://ascent.readthedocs.io/en/latest/Utilities.html#getting-data-for-replay>`_ is a utility that allows the user to ‘replay’ Conduit Blueprint HDF5 files saved by Ascent or exported by VisIt (starting in version 3.0 beta) back into Ascent. Replay enables the user or developer to pick specific time steps and load them into Ascent 
+
+We'll guide you through the procedure of how to use Replay through WarpX LWFA example
+
+1. Get Blueprint Files
+-------------------------
+To use replay, you first need Conduit Blueprint HDF5 files which could be extracted by replay. The following ascent actions file can be used to extract Conduit Blueprint HDF5 files.
+
+.. code-block:: json
+
+    -
+      action: action: "add_extracts"
+      extracts:
+        e1:
+          type: "relay"
+          params:
+            path: "my_output_file_name"
+            protocol: "blueprint/mesh/hdf5"
+
