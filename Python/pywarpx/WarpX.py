@@ -1,13 +1,22 @@
+# Copyright 2016-2020 Andrew Myers, David Grote, Maxence Thevenet
+# Remi Lehe
+#
+# This file is part of WarpX.
+#
+# License: BSD-3-Clause-LBNL
+
 from .Bucket import Bucket
-from .Constants import constants
+from .Constants import my_constants
 from .Amr import amr
 from .Geometry import geometry
 from .Algo import algo
 from .Langmuirwave import langmuirwave
 from .Interpolation import interpolation
-from .Laser import laser
+from .Lasers import lasers, lasers_list
 from . import Particles
 from .Particles import particles, particles_list
+from .PSATD import psatd
+from .Diagnostics import diagnostics
 
 
 class WarpX(Bucket):
@@ -18,18 +27,17 @@ class WarpX(Bucket):
     def create_argv_list(self):
         argv = []
         argv += warpx.attrlist()
-        argv += constants.attrlist()
+        argv += my_constants.attrlist()
         argv += amr.attrlist()
         argv += geometry.attrlist()
         argv += algo.attrlist()
         argv += langmuirwave.attrlist()
         argv += interpolation.attrlist()
-        argv += particles.attrlist()
-        argv += laser.attrlist()
+        argv += psatd.attrlist()
 
         # --- Search through species_names and add any predefined particle objects in the list.
         particles_list_names = [p.instancename for p in particles_list]
-        for pstring in particles.species_names.split(' '):
+        for pstring in particles.species_names:
             if pstring in particles_list_names:
                 # --- The species is already included in particles_list
                 continue
@@ -40,8 +48,21 @@ class WarpX(Bucket):
             else:
                 raise Exception('Species %s listed in species_names not defined'%pstring)
 
+        argv += particles.attrlist()
         for particle in particles_list:
             argv += particle.attrlist()
+
+        argv += lasers.attrlist()
+        for laser in lasers_list:
+            argv += laser.attrlist()
+
+        diagnostics.diags_names = diagnostics._diagnostics_dict.keys()
+        argv += diagnostics.attrlist()
+        for diagnostic in diagnostics._diagnostics_dict.values():
+            diagnostic.species = diagnostic._species_dict.keys()
+            argv += diagnostic.attrlist()
+            for species_diagnostic in diagnostic._species_dict.values():
+                argv += species_diagnostic.attrlist()
 
         return argv
 

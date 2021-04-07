@@ -1,4 +1,14 @@
+% Copyright 2017-2019 Remi Lehe
+%
+% This file is part of WarpX.
+%
+% License: BSD-3-Clause-LBNL
+
 \input{newcommands}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Inputs and outputs}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 Initialization of the plasma columns and drivers (laser or particle beam) is performed via the specification of multidimensional functions that describe the initial state with, if needed, a time dependence, or from reconstruction of distributions based on experimental data. Care is needed when initializing quantities in parallel to avoid double counting and ensure smoothness of the distributions at the interface of computational domains. When the sum of the initial distributions of charged particles is not charge neutral, initial fields are computed using generally a static approximation with Poisson solves accompanied by proper relativistic scalings \cite{Vaypop2008, CowanPRSTAB13}.
 

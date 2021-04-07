@@ -1,0 +1,185 @@
+/* Copyright 2019-2020 Yinjian Zhao
+ *
+ * This file is part of WarpX.
+ *
+ * License: BSD-3-Clause-LBNL
+ */
+
+#include "ParticleEnergy.H"
+#include "WarpX.H"
+#include "Utils/WarpXConst.H"
+
+#include <AMReX_REAL.H>
+#include <AMReX_ParticleReduce.H>
+
+#include <iostream>
+#include <cmath>
+#include <limits>
+
+
+using namespace amrex;
+
+// constructor
+ParticleEnergy::ParticleEnergy (std::string rd_name)
+: ReducedDiags{rd_name}
+{
+    // get a reference to WarpX instance
+    auto & warpx = WarpX::GetInstance();
+
+    // get MultiParticleContainer class object
+    const auto & mypc = warpx.GetPartContainer();
+
+    // get number of species (int)
+    const auto nSpecies = mypc.nSpecies();
+
+    // resize data array
+    m_data.resize(2*nSpecies+2, 0.0_rt);
+
+    // get species names (std::vector<std::string>)
+    const auto species_names = mypc.GetSpeciesNames();
+
+    if (ParallelDescriptor::IOProcessor())
+    {
+        if ( m_IsNotRestart )
+        {
+            // open file
+            std::ofstream ofs{m_path + m_rd_name + "." + m_extension, std::ofstream::out};
+            // write header row
+            ofs << "#";
+            ofs << "[1]step()";
+            ofs << m_sep;
+            ofs << "[2]time(s)";
+            ofs << m_sep;
+            ofs << "[3]total(J)";
+            for (int i = 0; i < nSpecies; ++i)
+            {
+                ofs << m_sep;
+                ofs << "[" + std::to_string(4+i) + "]";
+                ofs << species_names[i]+"(J)";
+            }
+            ofs << m_sep;
+            ofs << "[" + std::to_string(4+nSpecies) + "]";
+            ofs << "total_mean(J)";
+            for (int i = 0; i < nSpecies; ++i)
+            {
+                ofs << m_sep;
+                ofs << "[" + std::to_string(5+nSpecies+i) + "]";
+                ofs << species_names[i]+"_mean(J)";
+            }
+            ofs << std::endl;
+            // close file
+            ofs.close();
+        }
+    }
+
+}
+// end constructor
+
+// function that computes kinetic energy
+void ParticleEnergy::ComputeDiags (int step)
+{
+
+    // Judge if the diags should be done
+    if (!m_intervals.contains(step+1)) { return; }
+
+    // get MultiParticleContainer class object
+    const auto & mypc = WarpX::GetInstance().GetPartContainer();
+
+    // get number of species (int)
+    const auto nSpecies = mypc.nSpecies();
+
+    // get species names (std::vector<std::string>)
+    const auto species_names = mypc.GetSpeciesNames();
+
+    // speed of light squared
+    auto c2 = PhysConst::c * PhysConst::c;
+
+    // loop over species
+    for (int i_s = 0; i_s < nSpecies; ++i_s)
+    {
+        // get WarpXParticleContainer class object
+        const auto & myspc = mypc.GetParticleContainer(i_s);
+
+        // get mass (Real)
+        auto m = myspc.getMass();
+
+        using PType = typename WarpXParticleContainer::SuperParticleType;
+
+        // Use amrex::ReduceSum to compute the sum of energies of all particles
+        // held by the current MPI rank, for this species. This involves a loop over all
+        // boxes held by this MPI rank.
+        Real Etot = 0.0_rt;
+        if(myspc.AmIA<PhysicalSpecies::photon>()){
+            //Photons have m = 0, but ux,uy and uz are calculated assuming
+            //a mass equal to the electron mass. Therefore, photons need a special
+            //treatment to calculate the total energy.
+            constexpr auto me_c = PhysConst::m_e * PhysConst::c;
+            Etot = ReduceSum( myspc,
+            [=] AMREX_GPU_HOST_DEVICE (const PType& p) -> Real
+            {
+                const auto w  = p.rdata(PIdx::w);
+                const auto ux = p.rdata(PIdx::ux);
+                const auto uy = p.rdata(PIdx::uy);
+                const auto uz = p.rdata(PIdx::uz);
+                const auto us = ux*ux + uy*uy + uz*uz;
+                return std::sqrt(us) * me_c * w;
+            });
+        } else {
+            Etot = ReduceSum( myspc,
+            [=] AMREX_GPU_HOST_DEVICE (const PType& p) -> Real
+            {
+                const auto w  = p.rdata(PIdx::w);
+                const auto ux = p.rdata(PIdx::ux);
+                const auto uy = p.rdata(PIdx::uy);
+                const auto uz = p.rdata(PIdx::uz);
+                const auto us = ux*ux + uy*uy + uz*uz;
+                return ( std::sqrt(us*c2 + c2*c2) - c2 ) * m * w;
+            });
+        }
+
+        // Same thing for the particles weights.
+        auto Wtot = ReduceSum( myspc,
+        [=] AMREX_GPU_HOST_DEVICE (const PType& p) -> Real
+        {
+            return p.rdata(PIdx::w);
+        });
+
+        // reduced sum over mpi ranks
+        ParallelDescriptor::ReduceRealSum
+            (Etot, ParallelDescriptor::IOProcessorNumber());
+        ParallelDescriptor::ReduceRealSum
+            (Wtot, ParallelDescriptor::IOProcessorNumber());
+
+        // save results for this species i_s into m_data
+        m_data[i_s+1] = Etot;
+        if ( Wtot > std::numeric_limits<Real>::min() )
+        { m_data[nSpecies+2+i_s] = Etot / Wtot; }
+        else
+        { m_data[nSpecies+2+i_s] = 0.0; }
+
+    }
+    // end loop over species
+
+    // save total energy
+    // loop over species
+    m_data[0] = 0.0;          // total energy
+    m_data[nSpecies+1] = 0.0; // total mean energy
+    for (int i_s = 0; i_s < nSpecies; ++i_s)
+    {
+        m_data[0] += m_data[i_s+1];
+        m_data[nSpecies+1] += m_data[nSpecies+2+i_s];
+    }
+    // end loop over species
+
+    /* m_data now contains up-to-date values for:
+     *  [total energy (all species),
+     *   total energy (species 1),
+     *   ...,
+     *   total energy (species n),
+     *   mean energy (all species),
+     *   mean energy (species 1),
+     *   ...,
+     *   mean energy (species n)] */
+
+}
+// end void ParticleEnergy::ComputeDiags

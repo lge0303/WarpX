@@ -1,0 +1,15 @@
+target_sources(WarpX
+  PRIVATE
+    BeamRelevant.cpp
+    FieldEnergy.cpp
+    LoadBalanceCosts.cpp
+    LoadBalanceEfficiency.cpp
+    MultiReducedDiags.cpp
+    ParticleEnergy.cpp
+    ParticleHistogram.cpp
+    ReducedDiags.cpp
+    FieldMaximum.cpp
+    ParticleExtrema.cpp
+    RhoMaximum.cpp
+    ParticleNumber.cpp
+)

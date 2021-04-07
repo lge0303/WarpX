@@ -1,9 +1,19 @@
 #! /usr/bin/env python
 
+# Copyright 2018-2019 Andrew Myers, Jean-Luc Vay, Maxence Thevenet
+# Remi Lehe
+#
+# This file is part of WarpX.
+#
+# License: BSD-3-Clause-LBNL
+
+
 import sys
 import yt ; yt.funcs.mylog.setLevel(0)
 import numpy as np
 import scipy.constants as scc
+sys.path.insert(1, '../../../../warpx/Regression/Checksum/')
+import checksumAPI
 
 filename = sys.argv[1]
 
@@ -30,5 +40,16 @@ energy_end = energyE + energyB
 Reflectivity = energy_end/energy_start
 Reflectivity_theory = 5.683000058954201e-07
 
-assert( abs(Reflectivity-Reflectivity_theory) < 5./100 * Reflectivity_theory )
-    
+print("Reflectivity: %s" %Reflectivity)
+print("Reflectivity_theory: %s" %Reflectivity_theory)
+
+error_rel = abs(Reflectivity-Reflectivity_theory) / Reflectivity_theory
+tolerance_rel = 5./100
+
+print("error_rel    : " + str(error_rel))
+print("tolerance_rel: " + str(tolerance_rel))
+
+assert( error_rel < tolerance_rel )
+
+test_name = filename[:-9] # Could also be os.path.split(os.getcwd())[1]
+checksumAPI.evaluate_checksum(test_name, filename)

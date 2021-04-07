@@ -1,12 +1,27 @@
+# Copyright 2017-2019 Andrew Myers, David Grote, Remi Lehe
+# Weiqun Zhang
+#
+# This file is part of WarpX.
+#
+# License: BSD-3-Clause-LBNL
+
 # --- This defines the wrapper functions that directly call the underlying compiled routines
 import os
 import sys
+import atexit
 import ctypes
 from ctypes.util import find_library as _find_library
 import numpy as np
 from numpy.ctypeslib import ndpointer as _ndpointer
 
 from .Geometry import geometry
+
+try:
+    # --- If mpi4py is going to be used, this needs to be imported
+    # --- before libwarpx is loaded (though don't know why)
+    from mpi4py import MPI
+except ImportError:
+    pass
 
 # --- Is there a better way of handling constants?
 clight = 2.99792458e+8 # m/s
@@ -30,27 +45,61 @@ def _get_package_root():
 # --- Default to 3D if geometry is not setup yet.
 try:
     _prob_lo = geometry.prob_lo
+    _coord_sys = geometry.coord_sys
 except AttributeError:
-    geometry_dim = 3
+    geometry_dim = '3d'
 else:
-    geometry_dim = len(_prob_lo)
-    del _prob_lo
+    if _coord_sys == 0:
+        geometry_dim = '%dd'%len(_prob_lo)
+    elif _coord_sys == 1:
+        geometry_dim = 'rz'
+    else:
+        raise Exception('Undefined coordinate system %d'%_coord_sys)
+    del _prob_lo, _coord_sys
 
 _libc = ctypes.CDLL(_find_library('c'))
 
+# this is a plain C/C++ shared library, not a Python module
+if os.name == 'nt':
+    mod_ext = "dll"
+else:
+    mod_ext = "so"
+libname = "libwarpx.{0}.{1}".format(geometry_dim, mod_ext)
+
 try:
-    libwarpx = ctypes.CDLL(os.path.join(_get_package_root(), "libwarpx%dd.so"%geometry_dim))
+    libwarpx = ctypes.CDLL(os.path.join(_get_package_root(), libname))
 except OSError:
-    raise Exception('libwarpx%dd.so was not installed. It can be installed by running "make" in the Python directory of WarpX'%geometry_dim)
+    raise Exception('"%s" was not installed. It can be installed by running "make" in the Python directory of WarpX' % libname)
+
+# WarpX can be compiled using either double or float
+libwarpx.warpx_Real_size.restype = ctypes.c_int
+libwarpx.warpx_ParticleReal_size.restype = ctypes.c_int
+
+_Real_size = libwarpx.warpx_Real_size()
+_ParticleReal_size = libwarpx.warpx_ParticleReal_size()
+
+if _Real_size == 8:
+    c_real = ctypes.c_double
+    _numpy_real_dtype = 'f8'
+else:
+    c_real = ctypes.c_float
+    _numpy_real_dtype = 'f4'
+
+if _ParticleReal_size == 8:
+    c_particlereal = ctypes.c_double
+    _numpy_particlereal_dtype = 'f8'
+else:
+    c_particlereal = ctypes.c_float
+    _numpy_particlereal_dtype = 'f4'
 
 dim = libwarpx.warpx_SpaceDim()
 
-# our particle data type
-_p_struct = [(d, 'f8') for d in 'xyz'[:dim]] + [('id', 'i4'), ('cpu', 'i4')]
+# our particle data type, depends on _ParticleReal_size
+_p_struct = [(d, _numpy_particlereal_dtype) for d in 'xyz'[:dim]] + [('id', 'i4'), ('cpu', 'i4')]
 _p_dtype = np.dtype(_p_struct, align=True)
 
 _numpy_to_ctypes = {}
-_numpy_to_ctypes['f8'] = ctypes.c_double
+_numpy_to_ctypes[_numpy_particlereal_dtype] = c_particlereal
 _numpy_to_ctypes['i4'] = ctypes.c_int
 
 class Particle(ctypes.Structure):
@@ -61,8 +110,10 @@ class Particle(ctypes.Structure):
 _LP_particle_p = ctypes.POINTER(ctypes.POINTER(Particle))
 _LP_c_int = ctypes.POINTER(ctypes.c_int)
 _LP_c_void_p = ctypes.POINTER(ctypes.c_void_p)
-_LP_c_double = ctypes.POINTER(ctypes.c_double)
-_LP_LP_c_double = ctypes.POINTER(_LP_c_double)
+_LP_c_real = ctypes.POINTER(c_real)
+_LP_LP_c_real = ctypes.POINTER(_LP_c_real)
+_LP_c_particlereal = ctypes.POINTER(c_particlereal)
+_LP_LP_c_particlereal = ctypes.POINTER(_LP_c_particlereal)
 _LP_c_char = ctypes.POINTER(ctypes.c_char)
 _LP_LP_c_char = ctypes.POINTER(_LP_c_char)
 
@@ -86,63 +137,92 @@ def _array1d_from_pointer(pointer, dtype, size):
 # set the arg and return types of the wrapped functions
 libwarpx.amrex_init.argtypes = (ctypes.c_int, _LP_LP_c_char)
 libwarpx.warpx_getParticleStructs.restype = _LP_particle_p
-libwarpx.warpx_getParticleArrays.restype = _LP_LP_c_double
-libwarpx.warpx_getEfield.restype = _LP_LP_c_double
+libwarpx.warpx_getParticleArrays.restype = _LP_LP_c_particlereal
+libwarpx.warpx_getEfield.restype = _LP_LP_c_real
 libwarpx.warpx_getEfieldLoVects.restype = _LP_c_int
-libwarpx.warpx_getEfieldCP.restype = _LP_LP_c_double
+libwarpx.warpx_getEfieldCP.restype = _LP_LP_c_real
 libwarpx.warpx_getEfieldCPLoVects.restype = _LP_c_int
-libwarpx.warpx_getEfieldFP.restype = _LP_LP_c_double
+libwarpx.warpx_getEfieldFP.restype = _LP_LP_c_real
 libwarpx.warpx_getEfieldFPLoVects.restype = _LP_c_int
-libwarpx.warpx_getBfield.restype = _LP_LP_c_double
+libwarpx.warpx_getEfieldCP_PML.restype = _LP_LP_c_real
+libwarpx.warpx_getEfieldCPLoVects_PML.restype = _LP_c_int
+libwarpx.warpx_getEfieldFP_PML.restype = _LP_LP_c_real
+libwarpx.warpx_getEfieldFPLoVects_PML.restype = _LP_c_int
+libwarpx.warpx_getBfield.restype = _LP_LP_c_real
 libwarpx.warpx_getBfieldLoVects.restype = _LP_c_int
-libwarpx.warpx_getBfieldCP.restype = _LP_LP_c_double
+libwarpx.warpx_getBfieldCP.restype = _LP_LP_c_real
 libwarpx.warpx_getBfieldCPLoVects.restype = _LP_c_int
-libwarpx.warpx_getBfieldFP.restype = _LP_LP_c_double
+libwarpx.warpx_getBfieldFP.restype = _LP_LP_c_real
 libwarpx.warpx_getBfieldFPLoVects.restype = _LP_c_int
-libwarpx.warpx_getCurrentDensity.restype = _LP_LP_c_double
+libwarpx.warpx_getBfieldCP_PML.restype = _LP_LP_c_real
+libwarpx.warpx_getBfieldCPLoVects_PML.restype = _LP_c_int
+libwarpx.warpx_getBfieldFP_PML.restype = _LP_LP_c_real
+libwarpx.warpx_getBfieldFPLoVects_PML.restype = _LP_c_int
+libwarpx.warpx_getCurrentDensity.restype = _LP_LP_c_real
 libwarpx.warpx_getCurrentDensityLoVects.restype = _LP_c_int
-libwarpx.warpx_getCurrentDensityCP.restype = _LP_LP_c_double
+libwarpx.warpx_getCurrentDensityCP.restype = _LP_LP_c_real
 libwarpx.warpx_getCurrentDensityCPLoVects.restype = _LP_c_int
-libwarpx.warpx_getCurrentDensityFP.restype = _LP_LP_c_double
+libwarpx.warpx_getCurrentDensityFP.restype = _LP_LP_c_real
 libwarpx.warpx_getCurrentDensityFPLoVects.restype = _LP_c_int
+libwarpx.warpx_getCurrentDensityCP_PML.restype = _LP_LP_c_real
+libwarpx.warpx_getCurrentDensityCPLoVects_PML.restype = _LP_c_int
+libwarpx.warpx_getCurrentDensityFP_PML.restype = _LP_LP_c_real
+libwarpx.warpx_getCurrentDensityFPLoVects_PML.restype = _LP_c_int
+libwarpx.warpx_getChargeDensityCP.restype = _LP_LP_c_real
+libwarpx.warpx_getChargeDensityCPLoVects.restype = _LP_c_int
+libwarpx.warpx_getChargeDensityFP.restype = _LP_LP_c_real
+libwarpx.warpx_getChargeDensityFPLoVects.restype = _LP_c_int
 
-#libwarpx.warpx_getPMLSigma.restype = _LP_c_double
-#libwarpx.warpx_getPMLSigmaStar.restype = _LP_c_double
-#libwarpx.warpx_ComputePMLFactors.argtypes = (ctypes.c_int, ctypes.c_double)
+libwarpx.warpx_getEx_nodal_flag.restype = _LP_c_int
+libwarpx.warpx_getEy_nodal_flag.restype = _LP_c_int
+libwarpx.warpx_getEz_nodal_flag.restype = _LP_c_int
+libwarpx.warpx_getBx_nodal_flag.restype = _LP_c_int
+libwarpx.warpx_getBy_nodal_flag.restype = _LP_c_int
+libwarpx.warpx_getBz_nodal_flag.restype = _LP_c_int
+libwarpx.warpx_getJx_nodal_flag.restype = _LP_c_int
+libwarpx.warpx_getJy_nodal_flag.restype = _LP_c_int
+libwarpx.warpx_getJz_nodal_flag.restype = _LP_c_int
+libwarpx.warpx_getRho_nodal_flag.restype = _LP_c_int
+
+#libwarpx.warpx_getPMLSigma.restype = _LP_c_real
+#libwarpx.warpx_getPMLSigmaStar.restype = _LP_c_real
+#libwarpx.warpx_ComputePMLFactors.argtypes = (ctypes.c_int, c_real)
 
 libwarpx.warpx_addNParticles.argtypes = (ctypes.c_int, ctypes.c_int,
-                                         _ndpointer(ctypes.c_double, flags="C_CONTIGUOUS"),
-                                         _ndpointer(ctypes.c_double, flags="C_CONTIGUOUS"),
-                                         _ndpointer(ctypes.c_double, flags="C_CONTIGUOUS"),
-                                         _ndpointer(ctypes.c_double, flags="C_CONTIGUOUS"),
-                                         _ndpointer(ctypes.c_double, flags="C_CONTIGUOUS"),
-                                         _ndpointer(ctypes.c_double, flags="C_CONTIGUOUS"),
+                                         _ndpointer(c_particlereal, flags="C_CONTIGUOUS"),
+                                         _ndpointer(c_particlereal, flags="C_CONTIGUOUS"),
+                                         _ndpointer(c_particlereal, flags="C_CONTIGUOUS"),
+                                         _ndpointer(c_particlereal, flags="C_CONTIGUOUS"),
+                                         _ndpointer(c_particlereal, flags="C_CONTIGUOUS"),
+                                         _ndpointer(c_particlereal, flags="C_CONTIGUOUS"),
                                          ctypes.c_int,
-                                         _ndpointer(ctypes.c_double, flags="C_CONTIGUOUS"),
+                                         _ndpointer(c_particlereal, flags="C_CONTIGUOUS"),
                                          ctypes.c_int)
 
-libwarpx.warpx_getProbLo.restype = ctypes.c_double
-libwarpx.warpx_getProbHi.restype = ctypes.c_double
+libwarpx.warpx_getProbLo.restype = c_real
+libwarpx.warpx_getProbHi.restype = c_real
+libwarpx.warpx_getCellSize.restype = c_real
 libwarpx.warpx_getistep.restype = ctypes.c_int
-libwarpx.warpx_gett_new.restype = ctypes.c_double
-libwarpx.warpx_getdt.restype = ctypes.c_double
+libwarpx.warpx_gett_new.restype = c_real
+libwarpx.warpx_getdt.restype = c_real
 libwarpx.warpx_maxStep.restype = ctypes.c_int
-libwarpx.warpx_stopTime.restype = ctypes.c_double
-libwarpx.warpx_checkInt.restype = ctypes.c_int
-libwarpx.warpx_plotInt.restype = ctypes.c_int
+libwarpx.warpx_stopTime.restype = c_real
 libwarpx.warpx_finestLevel.restype = ctypes.c_int
 
-libwarpx.warpx_EvolveE.argtypes = [ctypes.c_double]
-libwarpx.warpx_EvolveB.argtypes = [ctypes.c_double]
+libwarpx.warpx_EvolveE.argtypes = [c_real]
+libwarpx.warpx_EvolveB.argtypes = [c_real]
 libwarpx.warpx_FillBoundaryE.argtypes = []
 libwarpx.warpx_FillBoundaryB.argtypes = []
 libwarpx.warpx_UpdateAuxilaryData.argtypes = []
 libwarpx.warpx_SyncCurrent.argtypes = []
-libwarpx.warpx_PushParticlesandDepose.argtypes = [ctypes.c_double]
+libwarpx.warpx_PushParticlesandDepose.argtypes = [c_real]
+libwarpx.warpx_getProbLo.argtypes = [ctypes.c_int]
+libwarpx.warpx_getProbHi.argtypes = [ctypes.c_int]
+libwarpx.warpx_getCellSize.argtypes = [ctypes.c_int, ctypes.c_int]
 libwarpx.warpx_getistep.argtypes = [ctypes.c_int]
 libwarpx.warpx_setistep.argtypes = [ctypes.c_int, ctypes.c_int]
 libwarpx.warpx_gett_new.argtypes = [ctypes.c_int]
-libwarpx.warpx_sett_new.argtypes = [ctypes.c_int, ctypes.c_double]
+libwarpx.warpx_sett_new.argtypes = [ctypes.c_int, c_real]
 libwarpx.warpx_getdt.argtypes = [ctypes.c_int]
 
 def get_nattr():
@@ -174,9 +254,13 @@ def initialize(argv=None):
     if argv is None:
         argv = sys.argv
     amrex_init(argv)
+    libwarpx.warpx_ConvertLabParamsToBoost()
+    if geometry_dim == 'rz':
+        libwarpx.warpx_CheckGriddingForRZSpectral()
     libwarpx.warpx_init()
 
 
+@atexit.register
 def finalize(finalize_mpi=1):
     '''
 
@@ -203,6 +287,22 @@ def evolve(num_steps=-1):
     '''
 
     libwarpx.warpx_evolve(num_steps);
+
+
+def getProbLo(direction):
+    assert 0 <= direction < dim, 'Inappropriate direction specified'
+    return libwarpx.warpx_getProbLo(direction)
+
+
+def getProbHi(direction):
+    assert 0 <= direction < dim, 'Inappropriate direction specified'
+    return libwarpx.warpx_getProbHi(direction)
+
+
+def getCellSize(direction, level=0):
+    assert 0 <= direction < 3, 'Inappropriate direction specified'
+    assert 0 <= level and level <= libwarpx.warpx_finestLevel(), 'Inappropriate level specified'
+    return libwarpx.warpx_getCellSize(direction, level)
 
 
 #def get_sigma(direction):
@@ -307,7 +407,7 @@ def add_particles(species_number=0,
                                  x, y, z, ux, uy, uz,
                                  attr.shape[-1], attr, unique_particles)
 
-def get_particle_structs(species_number):
+def get_particle_structs(species_number, level):
     '''
 
     This returns a list of numpy arrays containing the particle struct data
@@ -331,7 +431,7 @@ def get_particle_structs(species_number):
 
     particles_per_tile = _LP_c_int()
     num_tiles = ctypes.c_int(0)
-    data = libwarpx.warpx_getParticleStructs(species_number,
+    data = libwarpx.warpx_getParticleStructs(species_number, level,
                                              ctypes.byref(num_tiles),
                                              ctypes.byref(particles_per_tile))
 
@@ -345,7 +445,7 @@ def get_particle_structs(species_number):
     return particle_data
 
 
-def get_particle_arrays(species_number, comp):
+def get_particle_arrays(species_number, comp, level):
     '''
 
     This returns a list of numpy arrays containing the particle array data
@@ -369,14 +469,18 @@ def get_particle_arrays(species_number, comp):
 
     particles_per_tile = _LP_c_int()
     num_tiles = ctypes.c_int(0)
-    data = libwarpx.warpx_getParticleArrays(species_number, comp,
+    data = libwarpx.warpx_getParticleArrays(species_number, comp, level,
                                             ctypes.byref(num_tiles),
                                             ctypes.byref(particles_per_tile))
 
     particle_data = []
     for i in range(num_tiles.value):
         arr = np.ctypeslib.as_array(data[i], (particles_per_tile[i],))
-        arr.setflags(write=1)
+        try:
+            # This fails on some versions of numpy
+            arr.setflags(write=1)
+        except ValueError:
+            pass
         particle_data.append(arr)
 
     _libc.free(particles_per_tile)
@@ -384,62 +488,87 @@ def get_particle_arrays(species_number, comp):
     return particle_data
 
 
-def get_particle_x(species_number):
+def get_particle_x(species_number, level=0):
     '''
 
     Return a list of numpy arrays containing the particle 'x'
     positions on each tile.
 
     '''
-    structs = get_particle_structs(species_number)
-    return [struct['x'] for struct in structs]
+    structs = get_particle_structs(species_number, level)
+    if geometry_dim == '3d' or geometry_dim == '2d':
+        return [struct['x'] for struct in structs]
+    elif geometry_dim == 'rz':
+        return [struct['x']*np.cos(theta) for struct, theta in zip(structs, get_particle_theta(species_number))]
 
 
-def get_particle_y(species_number):
+def get_particle_y(species_number, level=0):
     '''
 
     Return a list of numpy arrays containing the particle 'y'
     positions on each tile.
 
     '''
-    structs = get_particle_structs(species_number)
-    return [struct['y'] for struct in structs]
+    structs = get_particle_structs(species_number, level)
+    if geometry_dim == '3d' or geometry_dim == '2d':
+        return [struct['y'] for struct in structs]
+    elif geometry_dim == 'rz':
+        return [struct['x']*np.sin(theta) for struct, theta in zip(structs, get_particle_theta(species_number))]
 
 
-def get_particle_z(species_number):
+def get_particle_r(species_number, level=0):
+    '''
+
+    Return a list of numpy arrays containing the particle 'r'
+    positions on each tile.
+
+    '''
+    structs = get_particle_structs(species_number, level)
+    if geometry_dim == 'rz':
+        return [struct['x'] for struct in structs]
+    elif geometry_dim == '3d':
+        return [np.sqrt(struct['x']**2 + struct['y']**2) for struct in structs]
+    elif geometry_dim == '2d':
+        raise Exception('get_particle_r: There is no r coordinate with 2D Cartesian')
+
+
+def get_particle_z(species_number, level=0):
     '''
 
     Return a list of numpy arrays containing the particle 'z'
     positions on each tile.
 
     '''
-    structs = get_particle_structs(species_number)
-    return [struct['z'] for struct in structs]
+    structs = get_particle_structs(species_number, level)
+    if geometry_dim == '3d':
+        return [struct['z'] for struct in structs]
+    elif geometry_dim == 'rz' or geometry_dim == '2d':
+        return [struct['y'] for struct in structs]
 
 
-def get_particle_id(species_number):
+def get_particle_id(species_number, level=0):
     '''
 
     Return a list of numpy arrays containing the particle 'id'
     positions on each tile.
 
     '''
-    structs = get_particle_structs(species_number)
+    structs = get_particle_structs(species_number, level)
     return [struct['id'] for struct in structs]
 
 
-def get_particle_cpu(species_number):
+def get_particle_cpu(species_number, level=0):
     '''
 
     Return a list of numpy arrays containing the particle 'cpu'
     positions on each tile.
 
     '''
-    structs = get_particle_structs(species_number)
+    structs = get_particle_structs(species_number, level)
     return [struct['cpu'] for struct in structs]
 
 
-def get_particle_weight(species_number):
+def get_particle_weight(species_number, level=0):
     '''
 
     Return a list of numpy arrays containing the particle
@@ -447,10 +576,10 @@ def get_particle_weight(species_number):
 
     '''
 
-    return get_particle_arrays(species_number, 0)
+    return get_particle_arrays(species_number, 0, level)
 
 
-def get_particle_ux(species_number):
+def get_particle_ux(species_number, level=0):
     '''
 
     Return a list of numpy arrays containing the particle
@@ -458,10 +587,10 @@ def get_particle_ux(species_number):
 
     '''
 
-    return get_particle_arrays(species_number, 1)
+    return get_particle_arrays(species_number, 1, level)
 
 
-def get_particle_uy(species_number):
+def get_particle_uy(species_number, level=0):
     '''
 
     Return a list of numpy arrays containing the particle
@@ -469,10 +598,10 @@ def get_particle_uy(species_number):
 
     '''
 
-    return get_particle_arrays(species_number, 2)
+    return get_particle_arrays(species_number, 2, level)
 
 
-def get_particle_uz(species_number):
+def get_particle_uz(species_number, level=0):
     '''
 
     Return a list of numpy arrays containing the particle
@@ -480,73 +609,63 @@ def get_particle_uz(species_number):
 
     '''
 
-    return get_particle_arrays(species_number, 3)
+    return get_particle_arrays(species_number, 3, level)
 
 
-def get_particle_Ex(species_number):
+def get_particle_theta(species_number, level=0):
     '''
 
     Return a list of numpy arrays containing the particle
-    x electric field on each tile.
+    theta on each tile.
 
     '''
 
-    return get_particle_arrays(species_number, 4)
+    if geometry_dim == 'rz':
+        return get_particle_arrays(species_number, 4, level)
+    elif geometry_dim == '3d':
+        return [np.arctan2(struct['y'], struct['x']) for struct in structs]
+    elif geometry_dim == '2d':
+        raise Exception('get_particle_r: There is no theta coordinate with 2D Cartesian')
 
 
-def get_particle_Ey(species_number):
-    '''
+def _get_mesh_field_list(warpx_func, level, direction, include_ghosts):
+    """
+     Generic routine to fetch the list of field data arrays.
+    """
+    shapes = _LP_c_int()
+    size = ctypes.c_int(0)
+    ncomps = ctypes.c_int(0)
+    ngrowvect = _LP_c_int()
+    if direction is None:
+        data = warpx_func(level,
+                          ctypes.byref(size), ctypes.byref(ncomps),
+                          ctypes.byref(ngrowvect), ctypes.byref(shapes))
+    else:
+        data = warpx_func(level, direction,
+                          ctypes.byref(size), ctypes.byref(ncomps),
+                          ctypes.byref(ngrowvect), ctypes.byref(shapes))
+    ngvect = [ngrowvect[i] for i in range(dim)]
+    grid_data = []
+    shapesize = dim
+    if ncomps.value > 1:
+        shapesize += 1
+    for i in range(size.value):
+        shape = tuple([shapes[shapesize*i + d] for d in range(shapesize)])
+        # --- The data is stored in Fortran order, hence shape is reversed and a transpose is taken.
+        arr = np.ctypeslib.as_array(data[i], shape[::-1]).T
+        try:
+            # This fails on some versions of numpy
+            arr.setflags(write=1)
+        except ValueError:
+            pass
+        if include_ghosts:
+            grid_data.append(arr)
+        else:
+            grid_data.append(arr[tuple([slice(ngvect[d], -ngvect[d]) for d in range(dim)])])
 
-    Return a list of numpy arrays containing the particle
-    y electric field on each tile.
-
-    '''
-
-    return get_particle_arrays(species_number, 5)
-
-
-def get_particle_Ez(species_number):
-    '''
-
-    Return a list of numpy arrays containing the particle
-    z electric field on each tile.
-
-    '''
-
-    return get_particle_arrays(species_number, 6)
-
-
-def get_particle_Bx(species_number):
-    '''
-
-    Return a list of numpy arrays containing the particle
-    x magnetic field on each tile.
-
-    '''
-
-    return get_particle_arrays(species_number, 7)
-
-
-def get_particle_By(species_number):
-    '''
-
-    Return a list of numpy arrays containing the particle
-    y magnetic field on each tile.
-
-    '''
-
-    return get_particle_arrays(species_number, 8)
-
-
-def get_particle_Bz(species_number):
-    '''
-
-    Return a list of numpy arrays containing the particle
-    z magnetic field on each tile.
-
-    '''
-
-    return get_particle_arrays(species_number, 9)
+    _libc.free(shapes)
+    _libc.free(data)
+    return grid_data
 
 
 def get_mesh_electric_field(level, direction, include_ghosts=True):
@@ -555,7 +674,7 @@ def get_mesh_electric_field(level, direction, include_ghosts=True):
     This returns a list of numpy arrays containing the mesh electric field
     data on each grid for this process.
 
-    This version is for the full "auxillary" solution on the given level.
+    This version is for the full "auxiliary" solution on the given level.
 
     The data for the numpy arrays are not copied, but share the underlying
     memory buffer with WarpX. The numpy arrays are fully writeable.
@@ -574,29 +693,7 @@ def get_mesh_electric_field(level, direction, include_ghosts=True):
 
     '''
 
-    assert(level == 0)
-
-    shapes = _LP_c_int()
-    size = ctypes.c_int(0)
-    ngrow = ctypes.c_int(0)
-    data = libwarpx.warpx_getEfield(level, direction,
-                                    ctypes.byref(size), ctypes.byref(ngrow),
-                                    ctypes.byref(shapes))
-    ng = ngrow.value
-    grid_data = []
-    for i in range(size.value):
-        shape = tuple([shapes[dim*i + d] for d in range(dim)])
-        # --- The data is stored in Fortran order, hence shape is reversed and a transpose is taken.
-        arr = np.ctypeslib.as_array(data[i], shape[::-1]).T
-        arr.setflags(write=1)
-        if include_ghosts:
-            grid_data.append(arr)
-        else:
-            grid_data.append(arr[[slice(ng, -ng) for _ in range(dim)]])
-
-    _libc.free(shapes)
-    _libc.free(data)
-    return grid_data
+    return _get_mesh_field_list(libwarpx.warpx_getEfield, level, direction, include_ghosts)
 
 
 def get_mesh_electric_field_cp(level, direction, include_ghosts=True):
@@ -623,29 +720,7 @@ def get_mesh_electric_field_cp(level, direction, include_ghosts=True):
 
     '''
 
-    assert(level == 0)
-
-    shapes = _LP_c_int()
-    size = ctypes.c_int(0)
-    ngrow = ctypes.c_int(0)
-    data = libwarpx.warpx_getEfieldCP(level, direction,
-                                      ctypes.byref(size), ctypes.byref(ngrow),
-                                      ctypes.byref(shapes))
-    ng = ngrow.value
-    grid_data = []
-    for i in range(size.value):
-        shape = tuple([shapes[dim*i + d] for d in range(dim)])
-        # --- The data is stored in Fortran order, hence shape is reversed and a transpose is taken.
-        arr = np.ctypeslib.as_array(data[i], shape[::-1]).T
-        arr.setflags(write=1)
-        if include_ghosts:
-            grid_data.append(arr)
-        else:
-            grid_data.append(arr[[slice(ng, -ng) for _ in range(dim)]])
-
-    _libc.free(shapes)
-    _libc.free(data)
-    return grid_data
+    return _get_mesh_field_list(libwarpx.warpx_getEfieldCP, level, direction, include_ghosts)
 
 
 def get_mesh_electric_field_fp(level, direction, include_ghosts=True):
@@ -672,38 +747,15 @@ def get_mesh_electric_field_fp(level, direction, include_ghosts=True):
 
     '''
 
-    assert(level == 0)
-
-    shapes = _LP_c_int()
-    size = ctypes.c_int(0)
-    ngrow = ctypes.c_int(0)
-    data = libwarpx.warpx_getEfieldFP(level, direction,
-                                      ctypes.byref(size), ctypes.byref(ngrow),
-                                      ctypes.byref(shapes))
-    ng = ngrow.value
-    grid_data = []
-    for i in range(size.value):
-        shape = tuple([shapes[dim*i + d] for d in range(dim)])
-        # --- The data is stored in Fortran order, hence shape is reversed and a transpose is taken.
-        arr = np.ctypeslib.as_array(data[i], shape[::-1]).T
-        arr.setflags(write=1)
-        if include_ghosts:
-            grid_data.append(arr)
-        else:
-            grid_data.append(arr[[slice(ng, -ng) for _ in range(dim)]])
-
-    _libc.free(shapes)
-    _libc.free(data)
-    return grid_data
+    return _get_mesh_field_list(libwarpx.warpx_getEfieldFP, level, direction, include_ghosts)
 
 
-def get_mesh_magnetic_field(level, direction, include_ghosts=True):
+def get_mesh_electric_field_cp_pml(level, direction, include_ghosts=True):
     '''
 
-    This returns a list of numpy arrays containing the mesh magnetic field
-    data on each grid for this process.
-
-    This version is for the full "auxillary" solution on the given level.
+    This returns a list of numpy arrays containing the mesh electric field
+    data on each grid for this process. This version returns the field on
+    the coarse patch for the PML for the given level.
 
     The data for the numpy arrays are not copied, but share the underlying
     memory buffer with WarpX. The numpy arrays are fully writeable.
@@ -722,29 +774,68 @@ def get_mesh_magnetic_field(level, direction, include_ghosts=True):
 
     '''
 
-    assert(level == 0)
+    try:
+        return _get_mesh_field_list(libwarpx.warpx_getEfieldCP_PML, level, direction, include_ghosts)
+    except ValueError:
+        raise Exception('PML not initialized')
 
-    shapes = _LP_c_int()
-    size = ctypes.c_int(0)
-    ngrow = ctypes.c_int(0)
-    data = libwarpx.warpx_getBfield(level, direction,
-                                    ctypes.byref(size), ctypes.byref(ngrow),
-                                    ctypes.byref(shapes))
-    ng = ngrow.value
-    grid_data = []
-    for i in range(size.value):
-        shape = tuple([shapes[dim*i + d] for d in range(dim)])
-        # --- The data is stored in Fortran order, hence shape is reversed and a transpose is taken.
-        arr = np.ctypeslib.as_array(data[i], shape[::-1]).T
-        arr.setflags(write=1)
-        if include_ghosts:
-            grid_data.append(arr)
-        else:
-            grid_data.append(arr[[slice(ng, -ng) for _ in range(dim)]])
 
-    _libc.free(shapes)
-    _libc.free(data)
-    return grid_data
+def get_mesh_electric_field_fp_pml(level, direction, include_ghosts=True):
+    '''
+
+    This returns a list of numpy arrays containing the mesh electric field
+    data on each grid for this process. This version returns the field on
+    the fine patch for the PML for the given level.
+
+    The data for the numpy arrays are not copied, but share the underlying
+    memory buffer with WarpX. The numpy arrays are fully writeable.
+
+    Parameters
+    ----------
+
+        level          : the AMR level to get the data for
+        direction      : the component of the data you want
+        include_ghosts : whether to include ghost zones or not
+
+    Returns
+    -------
+
+        A List of numpy arrays.
+
+    '''
+
+    try:
+        return _get_mesh_field_list(libwarpx.warpx_getEfieldFP_PML, level, direction, include_ghosts)
+    except ValueError:
+        raise Exception('PML not initialized')
+
+
+def get_mesh_magnetic_field(level, direction, include_ghosts=True):
+    '''
+
+    This returns a list of numpy arrays containing the mesh magnetic field
+    data on each grid for this process.
+
+    This version is for the full "auxiliary" solution on the given level.
+
+    The data for the numpy arrays are not copied, but share the underlying
+    memory buffer with WarpX. The numpy arrays are fully writeable.
+
+    Parameters
+    ----------
+
+        level          : the AMR level to get the data for
+        direction      : the component of the data you want
+        include_ghosts : whether to include ghost zones or not
+
+    Returns
+    -------
+
+        A List of numpy arrays.
+
+    '''
+
+    return _get_mesh_field_list(libwarpx.warpx_getBfield, level, direction, include_ghosts)
 
 
 def get_mesh_magnetic_field_cp(level, direction, include_ghosts=True):
@@ -771,29 +862,7 @@ def get_mesh_magnetic_field_cp(level, direction, include_ghosts=True):
 
     '''
 
-    assert(level == 0)
-
-    shapes = _LP_c_int()
-    size = ctypes.c_int(0)
-    ngrow = ctypes.c_int(0)
-    data = libwarpx.warpx_getBfieldCP(level, direction,
-                                      ctypes.byref(size), ctypes.byref(ngrow),
-                                      ctypes.byref(shapes))
-    ng = ngrow.value
-    grid_data = []
-    for i in range(size.value):
-        shape = tuple([shapes[dim*i + d] for d in range(dim)])
-        # --- The data is stored in Fortran order, hence shape is reversed and a transpose is taken.
-        arr = np.ctypeslib.as_array(data[i], shape[::-1]).T
-        arr.setflags(write=1)
-        if include_ghosts:
-            grid_data.append(arr)
-        else:
-            grid_data.append(arr[[slice(ng, -ng) for _ in range(dim)]])
-
-    _libc.free(shapes)
-    _libc.free(data)
-    return grid_data
+    return _get_mesh_field_list(libwarpx.warpx_getBfieldCP, level, direction, include_ghosts)
 
 
 def get_mesh_magnetic_field_fp(level, direction, include_ghosts=True):
@@ -820,29 +889,67 @@ def get_mesh_magnetic_field_fp(level, direction, include_ghosts=True):
 
     '''
 
-    assert(level == 0)
+    return _get_mesh_field_list(libwarpx.warpx_getBfieldFP, level, direction, include_ghosts)
 
-    shapes = _LP_c_int()
-    size = ctypes.c_int(0)
-    ngrow = ctypes.c_int(0)
-    data = libwarpx.warpx_getBfieldFP(level, direction,
-                                      ctypes.byref(size), ctypes.byref(ngrow),
-                                      ctypes.byref(shapes))
-    ng = ngrow.value
-    grid_data = []
-    for i in range(size.value):
-        shape = tuple([shapes[dim*i + d] for d in range(dim)])
-        # --- The data is stored in Fortran order, hence shape is reversed and a transpose is taken.
-        arr = np.ctypeslib.as_array(data[i], shape[::-1]).T
-        arr.setflags(write=1)
-        if include_ghosts:
-            grid_data.append(arr)
-        else:
-            grid_data.append(arr[[slice(ng, -ng) for _ in range(dim)]])
 
-    _libc.free(shapes)
-    _libc.free(data)
-    return grid_data
+def get_mesh_magnetic_field_cp_pml(level, direction, include_ghosts=True):
+    '''
+
+    This returns a list of numpy arrays containing the mesh magnetic field
+    data on each grid for this process. This version returns the field on
+    the coarse patch for the PML for the given level.
+
+    The data for the numpy arrays are not copied, but share the underlying
+    memory buffer with WarpX. The numpy arrays are fully writeable.
+
+    Parameters
+    ----------
+
+        level          : the AMR level to get the data for
+        direction      : the component of the data you want
+        include_ghosts : whether to include ghost zones or not
+
+    Returns
+    -------
+
+        A List of numpy arrays.
+
+    '''
+
+    try:
+        return _get_mesh_field_list(libwarpx.warpx_getBfieldCP_PML, level, direction, include_ghosts)
+    except ValueError:
+        raise Exception('PML not initialized')
+
+
+def get_mesh_magnetic_field_fp_pml(level, direction, include_ghosts=True):
+    '''
+
+    This returns a list of numpy arrays containing the mesh magnetic field
+    data on each grid for this process. This version returns the field on
+    the fine patch for the PML for the given level.
+
+    The data for the numpy arrays are not copied, but share the underlying
+    memory buffer with WarpX. The numpy arrays are fully writeable.
+
+    Parameters
+    ----------
+
+        level          : the AMR level to get the data for
+        direction      : the component of the data you want
+        include_ghosts : whether to include ghost zones or not
+
+    Returns
+    -------
+
+        A List of numpy arrays.
+
+    '''
+
+    try:
+        return _get_mesh_field_list(libwarpx.warpx_getBfieldFP_PML, level, direction, include_ghosts)
+    except ValueError:
+        raise Exception('PML not initialized')
 
 
 def get_mesh_current_density(level, direction, include_ghosts=True):
@@ -868,29 +975,7 @@ def get_mesh_current_density(level, direction, include_ghosts=True):
 
     '''
 
-    assert(level == 0)
-
-    shapes = _LP_c_int()
-    size = ctypes.c_int(0)
-    ngrow = ctypes.c_int(0)
-    data = libwarpx.warpx_getCurrentDensity(level, direction,
-                                            ctypes.byref(size), ctypes.byref(ngrow),
-                                            ctypes.byref(shapes))
-    ng = ngrow.value
-    grid_data = []
-    for i in range(size.value):
-        shape = tuple([shapes[dim*i + d] for d in range(dim)])
-        # --- The data is stored in Fortran order, hence shape is reversed and a transpose is taken.
-        arr = np.ctypeslib.as_array(data[i], shape[::-1]).T
-        arr.setflags(write=1)
-        if include_ghosts:
-            grid_data.append(arr)
-        else:
-            grid_data.append(arr[[slice(ng, -ng) for _ in range(dim)]])
-
-    _libc.free(shapes)
-    _libc.free(data)
-    return grid_data
+    return _get_mesh_field_list(libwarpx.warpx_getCurrentDensity, level, direction, include_ghosts)
 
 
 def get_mesh_current_density_cp(level, direction, include_ghosts=True):
@@ -917,29 +1002,7 @@ def get_mesh_current_density_cp(level, direction, include_ghosts=True):
 
     '''
 
-    assert(level == 0)
-
-    shapes = _LP_c_int()
-    size = ctypes.c_int(0)
-    ngrow = ctypes.c_int(0)
-    data = libwarpx.warpx_getCurrentDensityCP(level, direction,
-                                              ctypes.byref(size), ctypes.byref(ngrow),
-                                              ctypes.byref(shapes))
-    ng = ngrow.value
-    grid_data = []
-    for i in range(size.value):
-        shape = tuple([shapes[dim*i + d] for d in range(dim)])
-        # --- The data is stored in Fortran order, hence shape is reversed and a transpose is taken.
-        arr = np.ctypeslib.as_array(data[i], shape[::-1]).T
-        arr.setflags(write=1)
-        if include_ghosts:
-            grid_data.append(arr)
-        else:
-            grid_data.append(arr[[slice(ng, -ng) for _ in range(dim)]])
-
-    _libc.free(shapes)
-    _libc.free(data)
-    return grid_data
+    return _get_mesh_field_list(libwarpx.warpx_getCurrentDensityCP, level, direction, include_ghosts)
 
 
 def get_mesh_current_density_fp(level, direction, include_ghosts=True):
@@ -966,37 +1029,128 @@ def get_mesh_current_density_fp(level, direction, include_ghosts=True):
 
     '''
 
-    assert(level == 0)
-
-    shapes = _LP_c_int()
-    size = ctypes.c_int(0)
-    ngrow = ctypes.c_int(0)
-    data = libwarpx.warpx_getCurrentDensityFP(level, direction,
-                                              ctypes.byref(size), ctypes.byref(ngrow),
-                                              ctypes.byref(shapes))
-    ng = ngrow.value
-    grid_data = []
-    for i in range(size.value):
-        shape = tuple([shapes[dim*i + d] for d in range(dim)])
-        # --- The data is stored in Fortran order, hence shape is reversed and a transpose is taken.
-        arr = np.ctypeslib.as_array(data[i], shape[::-1]).T
-        arr.setflags(write=1)
-        if include_ghosts:
-            grid_data.append(arr)
-        else:
-            grid_data.append(arr[[slice(ng, -ng) for _ in range(dim)]])
-
-    _libc.free(shapes)
-    _libc.free(data)
-    return grid_data
+    return _get_mesh_field_list(libwarpx.warpx_getCurrentDensityFP, level, direction, include_ghosts)
 
 
-def _get_mesh_array_lovects(level, direction, include_ghosts=True, getarrayfunc=None):
+def get_mesh_current_density_cp_pml(level, direction, include_ghosts=True):
+    '''
+
+    This returns a list of numpy arrays containing the mesh current density
+    data on each grid for this process. This version returns the density for
+    the coarse patch for the PML for the given level.
+
+    The data for the numpy arrays are not copied, but share the underlying
+    memory buffer with WarpX. The numpy arrays are fully writeable.
+
+    Parameters
+    ----------
+
+        level          : the AMR level to get the data for
+        direction      : the component of the data you want
+        include_ghosts : whether to include ghost zones or not
+
+    Returns
+    -------
+
+        A List of numpy arrays.
+
+    '''
+
+    try:
+        return _get_mesh_field_list(libwarpx.warpx_getCurrentDensityCP_PML, level, direction, include_ghosts)
+    except ValueError:
+        raise Exception('PML not initialized')
+
+
+def get_mesh_current_density_fp_pml(level, direction, include_ghosts=True):
+    '''
+
+    This returns a list of numpy arrays containing the mesh current density
+    data on each grid for this process. This version returns the density on
+    the fine patch for the PML for the given level.
+
+    The data for the numpy arrays are not copied, but share the underlying
+    memory buffer with WarpX. The numpy arrays are fully writeable.
+
+    Parameters
+    ----------
+
+        level          : the AMR level to get the data for
+        direction      : the component of the data you want
+        include_ghosts : whether to include ghost zones or not
+
+    Returns
+    -------
+
+        A List of numpy arrays.
+
+    '''
+
+    try:
+        return _get_mesh_field_list(libwarpx.warpx_getCurrentDensityFP_PML, level, direction, include_ghosts)
+    except ValueError:
+        raise Exception('PML not initialized')
+def get_mesh_charge_density_cp(level, include_ghosts=True):
+    '''
+
+    This returns a list of numpy arrays containing the mesh charge density
+    data on each grid for this process. This version returns the density for
+    the coarse patch on the given level.
+
+    The data for the numpy arrays are not copied, but share the underlying
+    memory buffer with WarpX. The numpy arrays are fully writeable.
+
+    Parameters
+    ----------
+
+        level          : the AMR level to get the data for
+        include_ghosts : whether to include ghost zones or not
+
+    Returns
+    -------
+
+        A List of numpy arrays.
+
+    '''
+
+    return _get_mesh_field_list(libwarpx.warpx_getChargeDensityCP, level, None, include_ghosts)
+
+
+def get_mesh_charge_density_fp(level, include_ghosts=True):
+    '''
+
+    This returns a list of numpy arrays containing the mesh charge density
+    data on each grid for this process. This version returns the density on
+    the fine patch for the given level.
+
+    The data for the numpy arrays are not copied, but share the underlying
+    memory buffer with WarpX. The numpy arrays are fully writeable.
+
+    Parameters
+    ----------
+
+        level          : the AMR level to get the data for
+        include_ghosts : whether to include ghost zones or not
+
+    Returns
+    -------
+
+        A List of numpy arrays.
+
+    '''
+
+    return _get_mesh_field_list(libwarpx.warpx_getChargeDensityFP, level, None, include_ghosts)
+
+
+def _get_mesh_array_lovects(level, direction, include_ghosts=True, getlovectsfunc=None):
     assert(0 <= level and level <= libwarpx.warpx_finestLevel())
 
     size = ctypes.c_int(0)
-    ngrow = ctypes.c_int(0)
-    data = getarrayfunc(level, direction, ctypes.byref(size), ctypes.byref(ngrow))
+    ngrowvect = _LP_c_int()
+    if direction is None:
+        data = getlovectsfunc(level, ctypes.byref(size), ctypes.byref(ngrowvect))
+    else:
+        data = getlovectsfunc(level, direction, ctypes.byref(size), ctypes.byref(ngrowvect))
 
     lovects_ref = np.ctypeslib.as_array(data, (size.value, dim))
 
@@ -1004,12 +1158,18 @@ def _get_mesh_array_lovects(level, direction, include_ghosts=True, getarrayfunc=
     # --- Also, take the transpose to give shape (dims, number of grids)
     lovects = lovects_ref.copy().T
 
-    if not include_ghosts:
-        lovects += ngrow.value
+    ng = []
+    if include_ghosts:
+        for d in range(dim):
+            ng.append(ngrowvect[d])
+    else:
+        for d in range(dim):
+            ng.append(0)
+            lovects[d,:] += ngrowvect[d]
 
     del lovects_ref
     _libc.free(data)
-    return lovects
+    return lovects, ng
 
 
 def get_mesh_electric_field_lovects(level, direction, include_ghosts=True):
@@ -1018,7 +1178,7 @@ def get_mesh_electric_field_lovects(level, direction, include_ghosts=True):
     This returns a list of the lo vectors of the arrays containing the mesh electric field
     data on each grid for this process.
 
-    This version is for the full "auxillary" solution on the given level.
+    This version is for the full "auxiliary" solution on the given level.
 
     Parameters
     ----------
@@ -1080,13 +1240,63 @@ def get_mesh_electric_field_fp_lovects(level, direction, include_ghosts=True):
     return _get_mesh_array_lovects(level, direction, include_ghosts, libwarpx.warpx_getEfieldFPLoVects)
 
 
+def get_mesh_electric_field_cp_lovects_pml(level, direction, include_ghosts=True):
+    '''
+
+    This returns a list of the lo vectors of the arrays containing the mesh electric field
+    data on each PML grid for this process.
+
+    Parameters
+    ----------
+
+        level          : the AMR level to get the data for
+        direction      : the component of the data you want
+        include_ghosts : whether to include ghost zones or not
+
+    Returns
+    -------
+
+        A 2d numpy array of the lo vector for each grid with the shape (dims, number of grids)
+
+    '''
+    try:
+        return _get_mesh_array_lovects(level, direction, include_ghosts, libwarpx.warpx_getEfieldCPLoVects_PML)
+    except ValueError:
+        raise Exception('PML not initialized')
+
+
+def get_mesh_electric_field_fp_lovects_pml(level, direction, include_ghosts=True):
+    '''
+
+    This returns a list of the lo vectors of the arrays containing the mesh electric field
+    data on each PML grid for this process.
+
+    Parameters
+    ----------
+
+        level          : the AMR level to get the data for
+        direction      : the component of the data you want
+        include_ghosts : whether to include ghost zones or not
+
+    Returns
+    -------
+
+        A 2d numpy array of the lo vector for each grid with the shape (dims, number of grids)
+
+    '''
+    try:
+        return _get_mesh_array_lovects(level, direction, include_ghosts, libwarpx.warpx_getEfieldFPLoVects_PML)
+    except ValueError:
+        raise Exception('PML not initialized')
+
+
 def get_mesh_magnetic_field_lovects(level, direction, include_ghosts=True):
     '''
 
     This returns a list of the lo vectors of the arrays containing the mesh electric field
     data on each grid for this process.
 
-    This version is for the full "auxillary" solution on the given level.
+    This version is for the full "auxiliary" solution on the given level.
 
     Parameters
     ----------
@@ -1146,6 +1356,56 @@ def get_mesh_magnetic_field_fp_lovects(level, direction, include_ghosts=True):
 
     '''
     return _get_mesh_array_lovects(level, direction, include_ghosts, libwarpx.warpx_getBfieldFPLoVects)
+
+
+def get_mesh_magnetic_field_cp_lovects_pml(level, direction, include_ghosts=True):
+    '''
+
+    This returns a list of the lo vectors of the arrays containing the mesh electric field
+    data on each PML grid for this process.
+
+    Parameters
+    ----------
+
+        level          : the AMR level to get the data for
+        direction      : the component of the data you want
+        include_ghosts : whether to include ghost zones or not
+
+    Returns
+    -------
+
+        A 2d numpy array of the lo vector for each grid with the shape (dims, number of grids)
+
+    '''
+    try:
+        return _get_mesh_array_lovects(level, direction, include_ghosts, libwarpx.warpx_getBfieldCPLoVects_PML)
+    except ValueError:
+        raise Exception('PML not initialized')
+
+
+def get_mesh_magnetic_field_fp_lovects_pml(level, direction, include_ghosts=True):
+    '''
+
+    This returns a list of the lo vectors of the arrays containing the mesh electric field
+    data on each PML grid for this process.
+
+    Parameters
+    ----------
+
+        level          : the AMR level to get the data for
+        direction      : the component of the data you want
+        include_ghosts : whether to include ghost zones or not
+
+    Returns
+    -------
+
+        A 2d numpy array of the lo vector for each grid with the shape (dims, number of grids)
+
+    '''
+    try:
+        return _get_mesh_array_lovects(level, direction, include_ghosts, libwarpx.warpx_getBfieldFPLoVects_PML)
+    except ValueError:
+        raise Exception('PML not initialized')
 
 
 def get_mesh_current_density_lovects(level, direction, include_ghosts=True):
@@ -1211,3 +1471,175 @@ def get_mesh_current_density_fp_lovects(level, direction, include_ghosts=True):
 
     '''
     return _get_mesh_array_lovects(level, direction, include_ghosts, libwarpx.warpx_getCurrentDensityFPLoVects)
+
+
+def get_mesh_current_density_cp_lovects_pml(level, direction, include_ghosts=True):
+    '''
+
+    This returns a list of the lo vectors of the arrays containing the mesh electric field
+    data on each PML grid for this process.
+
+    Parameters
+    ----------
+
+        level          : the AMR level to get the data for
+        direction      : the component of the data you want
+        include_ghosts : whether to include ghost zones or not
+
+    Returns
+    -------
+
+        A 2d numpy array of the lo vector for each grid with the shape (dims, number of grids)
+
+    '''
+    try:
+        return _get_mesh_array_lovects(level, direction, include_ghosts, libwarpx.warpx_getCurrentDensityCPLoVects_PML)
+    except ValueError:
+        raise Exception('PML not initialized')
+
+def get_mesh_current_density_fp_lovects_pml(level, direction, include_ghosts=True):
+    '''
+
+    This returns a list of the lo vectors of the arrays containing the mesh electric field
+    data on each PML grid for this process.
+
+    Parameters
+    ----------
+
+        level          : the AMR level to get the data for
+        direction      : the component of the data you want
+        include_ghosts : whether to include ghost zones or not
+
+    Returns
+    -------
+
+        A 2d numpy array of the lo vector for each grid with the shape (dims, number of grids)
+
+    '''
+    try:
+        return _get_mesh_array_lovects(level, direction, include_ghosts, libwarpx.warpx_getCurrentDensityFPLoVects_PML)
+    except ValueError:
+        raise Exception('PML not initialized')
+
+
+def get_mesh_charge_density_cp_lovects(level, include_ghosts=True):
+    '''
+
+    This returns a list of the lo vectors of the arrays containing the mesh electric field
+    data on each grid for this process.
+
+    Parameters
+    ----------
+
+        level          : the AMR level to get the data for
+        include_ghosts : whether to include ghost zones or not
+
+    Returns
+    -------
+
+        A 2d numpy array of the lo vector for each grid with the shape (dims, number of grids)
+
+    '''
+    return _get_mesh_array_lovects(level, None, include_ghosts, libwarpx.warpx_getChargeDensityCPLoVects)
+
+def get_mesh_charge_density_fp_lovects(level, include_ghosts=True):
+    '''
+
+    This returns a list of the lo vectors of the arrays containing the mesh electric field
+    data on each grid for this process.
+
+    Parameters
+    ----------
+
+        level          : the AMR level to get the data for
+        include_ghosts : whether to include ghost zones or not
+
+    Returns
+    -------
+
+        A 2d numpy array of the lo vector for each grid with the shape (dims, number of grids)
+
+    '''
+    return _get_mesh_array_lovects(level, None, include_ghosts, libwarpx.warpx_getChargeDensityFPLoVects)
+
+
+def _get_nodal_flag(getdatafunc):
+    data = getdatafunc()
+    nodal_flag_ref = np.ctypeslib.as_array(data, (dim,))
+
+    # --- Make a copy of the data to avoid memory problems
+    nodal_flag = nodal_flag_ref.copy()
+
+    del nodal_flag_ref
+    _libc.free(data)
+    return nodal_flag
+
+
+def get_Ex_nodal_flag():
+    '''
+    This returns a 1d array of the nodal flags for Ex along each direction. A 1 means node centered, and 0 cell centered.
+    '''
+    return _get_nodal_flag(libwarpx.warpx_getEx_nodal_flag)
+
+
+def get_Ey_nodal_flag():
+    '''
+    This returns a 1d array of the nodal flags for Ey along each direction. A 1 means node centered, and 0 cell centered.
+    '''
+    return _get_nodal_flag(libwarpx.warpx_getEy_nodal_flag)
+
+
+def get_Ez_nodal_flag():
+    '''
+    This returns a 1d array of the nodal flags for Ez along each direction. A 1 means node centered, and 0 cell centered.
+    '''
+    return _get_nodal_flag(libwarpx.warpx_getEz_nodal_flag)
+
+
+def get_Bx_nodal_flag():
+    '''
+    This returns a 1d array of the nodal flags for Bx along each direction. A 1 means node centered, and 0 cell centered.
+    '''
+    return _get_nodal_flag(libwarpx.warpx_getBx_nodal_flag)
+
+
+def get_By_nodal_flag():
+    '''
+    This returns a 1d array of the nodal flags for By along each direction. A 1 means node centered, and 0 cell centered.
+    '''
+    return _get_nodal_flag(libwarpx.warpx_getBy_nodal_flag)
+
+
+def get_Bz_nodal_flag():
+    '''
+    This returns a 1d array of the nodal flags for Bz along each direction. A 1 means node centered, and 0 cell centered.
+    '''
+    return _get_nodal_flag(libwarpx.warpx_getBz_nodal_flag)
+
+
+def get_Jx_nodal_flag():
+    '''
+    This returns a 1d array of the nodal flags for Jx along each direction. A 1 means node centered, and 0 cell centered.
+    '''
+    return _get_nodal_flag(libwarpx.warpx_getJx_nodal_flag)
+
+
+def get_Jy_nodal_flag():
+    '''
+    This returns a 1d array of the nodal flags for Jy along each direction. A 1 means node centered, and 0 cell centered.
+    '''
+    return _get_nodal_flag(libwarpx.warpx_getJy_nodal_flag)
+
+
+def get_Jz_nodal_flag():
+    '''
+    This returns a 1d array of the nodal flags for Jz along each direction. A 1 means node centered, and 0 cell centered.
+    '''
+    return _get_nodal_flag(libwarpx.warpx_getJz_nodal_flag)
+
+
+def get_Rho_nodal_flag():
+    '''
+    This returns a 1d array of the nodal flags for Rho along each direction. A 1 means node centered, and 0 cell centered.
+    '''
+    return _get_nodal_flag(libwarpx.warpx_getRho_nodal_flag)
